@@ -1,0 +1,241 @@
+#!/usr/bin/env python
+import os
+import re
+import sys
+import enum
+import argparse
+import subprocess
+import logging
+import dataclasses
+
+import dbus  # type: ignore
+
+
+logging.basicConfig(level=logging.WARNING,
+                    format='%(asctime)s %(levelname)-8s %(message)s')
+
+
+class DynamicMenuError(Exception):
+    pass
+
+
+class CommandError(Exception):
+    pass
+
+
+class NotificationType(enum.Enum):
+    Info = 0
+    Warn = 1
+    Error = 2
+
+
+class Policy(enum.Enum):
+    Allow = 0
+    Block = 1
+    Reject = 2
+
+
+@dataclasses.dataclass
+class Device:
+    index: int
+    id: str
+    state: str
+    name: str
+    via_port: str
+    with_connect_type: str
+
+    def to_displayed_line(self):
+        if self.name:
+            name = self.name
+        else:
+            name = "\"Nameless\""
+
+        return "{:<8} {:<42} (ID {}, Port \"{}\", Connection type \"{}\")".format(
+            self.state,
+            name,
+            self.id,
+            self.via_port,
+            self.with_connect_type
+        )
+
+
+def get_notify_interface():
+    # Check existence of interface
+    try:
+        dbus.SessionBus().list_names()\
+                         .index("org.freedesktop.Notifications")  # type: ignore
+    except ValueError:
+        logging.warning("D-Bus object for notifications not exists!")
+        return
+
+    object = dbus.SessionBus().get_object("org.freedesktop.Notifications",
+                                          "/org/freedesktop/Notifications")
+    notify_interface = dbus.Interface(object, "org.freedesktop.Notifications")
+
+    return notify_interface
+
+
+def send_notification_about_success(headline, text):
+    notify_interface = get_notify_interface()
+
+    icon_name = "dialog-info"
+    notify_interface.Notify(  # type: ignore
+        "dmenu_systemd", 0, icon_name,
+        headline, text,
+        [], {"urgency": NotificationType.Info.value}, 3000
+    )
+
+
+def send_error_notification(headline, text):
+    notify_interface = get_notify_interface()
+
+    icon_name = "dialog-warning"
+    notify_interface.Notify(  # type: ignore
+        "dmenu_systemd", 0, icon_name,
+        headline, text,
+        [], {"urgency": NotificationType.Error.value}, 3000
+    )
+
+
+def show_menu(dmenu_command: list[str], lines: list[str]) -> str:
+    process = subprocess.Popen(
+        dmenu_command,
+        stdout=subprocess.PIPE,
+        stdin=subprocess.PIPE,
+        stderr=subprocess.PIPE
+    )
+    concatenated_lines = "\n".join(lines)
+    selected_line, errors = process.communicate(
+        input=concatenated_lines.encode()
+    )
+
+    selected_line = selected_line.decode().strip()
+    errors = errors.decode().strip()
+
+    if selected_line == "":
+        return ""
+    elif process.returncode != 0:
+        logging.warning(errors)
+        send_error_notification("Dynamic menu error!",
+                                "Return code: {}".format(process.returncode))
+
+        raise DynamicMenuError()
+
+    return selected_line
+
+
+def run_command(cmd: list[str]) -> list[str]:
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=os.environ
+    )
+
+    output, errors = process.communicate()
+    errors = errors.decode().strip()
+
+    if process.returncode != 0:
+        logging.error(errors)
+        send_error_notification(
+            "Terminal error!",
+            f"Return code: {process.returncode}.\n{errors}"
+        )
+        raise CommandError()
+
+    return output.decode().splitlines()
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "-d", "--dmenu-command", type=str, action="store",
+        default="wofi --dmenu --gtk-dark --insensitive",
+        help="Command that invokes dmenu-like menu that will be used to show lines."
+    )
+
+    args = parser.parse_args()
+
+    return args
+
+
+def get_devices_interface():
+    object = dbus.SystemBus().get_object("org.usbguard1", "/org/usbguard1/Devices")
+    interface = dbus.Interface(object, "org.usbguard.Devices1")
+
+    return interface
+
+
+def get_devices() -> list[Device]:
+    interface = get_devices_interface()
+    index_info_pairs = [(string[0], string[1])
+                        for string in interface.listDevices("match")]
+    result = []
+    for index, info in index_info_pairs:
+        match_obj = re.match(
+            R"(?P<state>\w+)"
+            R"\s+id\s+(?P<id>.+)"
+            R"\s+serial\s+\".*\""
+            R"\s+name\s+\"(?P<name>.*)\""
+            R"\s+hash\s+\".+\""
+            R"\s+parent-hash\s+\".+\""
+            R"\s+via-port\s+\"(?P<port>.+)\""
+            R"\s+with-interface\s+.+"
+            R"\s+with-connect-type\s+\"(?P<withconnecttype>.*)\"",
+            info
+        )
+        if match_obj is None:
+            send_error_notification("Parse error",
+                                    "Can't process info line: {}".format(info))
+            continue
+
+        result.append(
+            Device(
+                int(index),
+                match_obj.group("id"),
+                match_obj.group("state"),
+                match_obj.group("name"),
+                match_obj.group("port"),
+                match_obj.group("withconnecttype")
+            )
+        )
+
+    return result
+
+
+def applyDevicePolicy(device_index: int, policy: Policy):
+    interface = get_devices_interface()
+    interface.applyDevicePolicy(device_index, policy.value, False)
+
+
+def main():
+    args = parse_arguments()
+    dmenu_command = args.dmenu_command.split(" ")
+
+    devices = get_devices()
+
+    devices_lines = [device.to_displayed_line() for device in devices]
+    selected_device_line = show_menu(dmenu_command, devices_lines)
+    if not selected_device_line:
+        return 0
+
+    selected_line_index = devices_lines.index(selected_device_line)
+    selected_device_info = devices[selected_line_index]
+
+    action = show_menu(dmenu_command, ["Allow", "Block", "Reject"]).lower()
+    if action == "allow":
+        policy = Policy.Allow
+    elif action == "block":
+        policy = Policy.Block
+    elif action == "reject":
+        policy = Policy.Reject
+    else:
+        raise NotImplementedError()
+
+    applyDevicePolicy(selected_device_info.index, policy)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
